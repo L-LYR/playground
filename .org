@@ -1,0 +1,13 @@
+#+TITLE: Recent Work
+#+OPTIONS:
+
+* 23/02/06-23/02/12
+** 尝试 spack
+** 尝试 libfabric mercury
+** 尝试给 spdk dpdk 写一个 spack 的打包脚本
+*** 失败 spack 对 meson 的支持有限
+** 尝试 coroutine + spdk nvme
+
+
+* TODO coroutine spdk nvme io
+* TODO coroutine rdma runtime
