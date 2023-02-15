@@ -10,6 +10,7 @@ class Status {
     kDeviceFailure,
     kIoQueueFull,
     kIoFailure,
+    kInternalError,
   };
 
  public:
@@ -29,6 +30,7 @@ class Status {
   static auto DeviceFailure() -> Status { return Status(Code::kDeviceFailure); }
   static auto IoQueueFull() -> Status { return Status(Code::kIoQueueFull); }
   static auto IoFailure() -> Status { return Status(Code::kIoFailure); }
+  static auto InternalError() -> Status { return Status(Code::kInternalError); }
 
   auto IsOK() const -> bool { return status_code_ == Code::kOk; }
   auto IsInvalidArgs() const -> bool {
@@ -41,6 +43,9 @@ class Status {
     return status_code_ == Code::kIoQueueFull;
   }
   auto IsIoFailure() const -> bool { return status_code_ == Code::kIoFailure; }
+  auto IsInternalError() const -> bool {
+    return status_code_ == Code::kInternalError;
+  }
 
  private:
   // no public ctor

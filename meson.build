@@ -10,9 +10,14 @@ project(
     ],
 )
 
-add_project_arguments('-Wno-unused-parameter', language: ['c', 'cpp'])
+add_project_arguments(
+    '-Wno-unused-parameter',
+    # '-fcoroutines-ts',
+    language: ['c', 'cpp'],
+)
 
 common_include_directories = include_directories('include')
 
+subdir('common')
 subdir('argobots_play')
 subdir('driver')

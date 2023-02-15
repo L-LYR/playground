@@ -2,11 +2,6 @@
 
 #include <spdlog/spdlog.h>
 
-#include <boost/asio/co_spawn.hpp>
-#include <boost/asio/compose.hpp>
-#include <boost/asio/detached.hpp>
-#include <boost/asio/steady_timer.hpp>
-#include <boost/asio/use_awaitable.hpp>
 #include <chrono>
 
 using namespace std::chrono_literals;
@@ -20,14 +15,17 @@ auto DevConfig::Format() const -> std::string {
                      (subnqn.empty() ? SPDK_NVMF_DISCOVERY_NQN : subnqn));
 }
 
-Dev::Dev() : coro_ctx(1), strand_(asio::make_strand(coro_ctx.get_executor())) {}
+Dev::Dev(boost::asio::io_context &ctx)
+    : trid_(new spdk_nvme_transport_id), coro_ctx(ctx) {}
 
-Dev::~Dev() {}
+Dev::~Dev() { delete trid_; }
 
-auto Dev::PollAdminQueue() -> asio::awaitable<void> {
+auto Dev::PollAdminQueue() -> boost::asio::awaitable<void> {
+  SPDLOG_INFO("start polling admin queue");
+
   int rc = 0;
   auto reason = SPDK_NVME_QPAIR_FAILURE_NONE;
-  asio::steady_timer interval_timer(coro_ctx, 10us);
+  boost::asio::high_resolution_timer interval_timer(coro_ctx, 10us);
   while (admin_poller_running_.load(std::memory_order_relaxed)) {
     rc = spdk_nvme_ctrlr_process_admin_completions(ctrlr_);
     if (rc < 0) {
@@ -39,14 +37,16 @@ auto Dev::PollAdminQueue() -> asio::awaitable<void> {
                      int(reason));
       }
     }
-    co_await interval_timer.async_wait(asio::use_awaitable);
+    co_await interval_timer.async_wait(boost::asio::use_awaitable);
   }
-  co_return;
 }
 
-auto Dev::PollIoQueue() -> asio::awaitable<void> {
+auto Dev::PollIoQueue() -> boost::asio::awaitable<void> {
+  SPDLOG_INFO("start polling io queue");
+
   int rc = 0;
   auto reason = SPDK_NVME_QPAIR_FAILURE_NONE;
+  boost::asio::high_resolution_timer interval_timer(coro_ctx, 1ns);
   while (io_poller_running_.load(std::memory_order_relaxed)) {
     rc = spdk_nvme_qpair_process_completions(qpair_, max_depth_);
     if (rc < 0) {
@@ -56,6 +56,7 @@ auto Dev::PollIoQueue() -> asio::awaitable<void> {
                      int(reason), rc);
       }
     }
+    co_await interval_timer.async_wait(boost::asio::use_awaitable);
   }
   co_return;
 }
@@ -63,26 +64,45 @@ auto Dev::PollIoQueue() -> asio::awaitable<void> {
 auto Dev::Attach(const DevConfig &config) -> Status {
   //* parse config
   auto formatted_config = config.Format();
-  if (auto rc = spdk_nvme_transport_id_parse(&trid_, formatted_config.c_str());
+  if (auto rc = spdk_nvme_transport_id_parse(trid_, formatted_config.c_str());
       rc != 0) {
     SPDLOG_ERROR("fail to parse nvme transport id, rc: {}", rc);
     return Status::InvalidArgs();
   }
-  SPDLOG_INFO("formatted config: {}", formatted_config);
+  SPDLOG_TRACE("formatted config: {}", formatted_config);
 
   //* probe device
   auto probe_cb = [](void *, const spdk_nvme_transport_id *trid,
                      spdk_nvme_ctrlr_opts *) -> bool {
-    SPDLOG_INFO("attaching to {}", std::string_view(trid->traddr));
+    SPDLOG_INFO("attaching to {}:{}", std::string_view(trid->traddr),
+                std::string_view(trid->trsvcid));
     return true;
   };
   auto attach_cb = [](void *ctx, const spdk_nvme_transport_id *trid,
                       spdk_nvme_ctrlr *ctrlr,
                       const spdk_nvme_ctrlr_opts *) -> void {
     ((Dev *)ctx)->ctrlr_ = ctrlr;
-    SPDLOG_INFO("attached to {}", std::string_view(trid->traddr));
+    SPDLOG_INFO("attached to {}:{}", std::string_view(trid->traddr),
+                std::string_view(trid->trsvcid));
+    auto ctrlr_data = spdk_nvme_ctrlr_get_data(ctrlr);
+    SPDLOG_INFO("SN: {:20}",
+                std::string_view(
+                    (const char *)ctrlr_data->sn,
+                    (const char *)(ctrlr_data->sn + SPDK_NVME_CTRLR_SN_LEN)));
+    SPDLOG_INFO("MN: {:40}",
+                std::string_view(
+                    (const char *)ctrlr_data->mn,
+                    (const char *)(ctrlr_data->mn + SPDK_NVME_CTRLR_MN_LEN)));
+    SPDLOG_INFO("FR: {:8}",
+                std::string_view(
+                    (const char *)ctrlr_data->fr,
+                    (const char *)(ctrlr_data->fr + SPDK_NVME_CTRLR_FR_LEN)));
+    SPDLOG_INFO("subnqn: {:8}",
+                std::string_view((const char *)ctrlr_data->subnqn,
+                                 (const char *)(ctrlr_data->subnqn +
+                                                SPDK_NVME_NQN_FIELD_SIZE)));
   };
-  if (auto rc = spdk_nvme_probe(&trid_, this, probe_cb, attach_cb, nullptr);
+  if (auto rc = spdk_nvme_probe(trid_, this, probe_cb, attach_cb, nullptr);
       rc != 0) {
     SPDLOG_ERROR("fail to probe nvme device, rc: {}", rc);
     return Status::DeviceFailure();
@@ -101,10 +121,12 @@ auto Dev::Attach(const DevConfig &config) -> Status {
   }
   if (ns_ == nullptr) {
     SPDLOG_ERROR("fail to find namespace{} in {}, detach", config.ns_id,
-                 std::string_view(trid_.traddr));
+                 std::string_view(trid_->traddr));
     spdk_nvme_detach(ctrlr_);
     return Status::DeviceFailure();
   }
+  SPDLOG_INFO("got namespace {}, size: {} GiB", config.ns_id,
+              n_sector_ * sector_size_ / 1000 / 1000 / 1000);
 
   //* allocate qpair
   spdk_nvme_io_qpair_opts opts{};
@@ -114,19 +136,21 @@ auto Dev::Attach(const DevConfig &config) -> Status {
   qpair_ = spdk_nvme_ctrlr_alloc_io_qpair(ctrlr_, &opts, sizeof(opts));
   if (qpair_ == nullptr) {
     SPDLOG_ERROR("fail to allocate qpair in {}, detach",
-                 std::string_view(trid_.traddr));
+                 std::string_view(trid_->traddr));
     spdk_nvme_detach(ctrlr_);
     return Status::DeviceFailure();
   }
+  SPDLOG_TRACE("created a qpair");
 
   //* admin poller
   admin_poller_running_ = true;
-  asio::co_spawn(coro_ctx, PollAdminQueue(), asio::detached);
+  boost::asio::co_spawn(coro_ctx, PollAdminQueue(), boost::asio::detached);
 
   //* io poller
   io_poller_running_ = true;
-  asio::co_spawn(coro_ctx, PollIoQueue(), asio::detached);
+  boost::asio::co_spawn(coro_ctx, PollIoQueue(), boost::asio::detached);
 
+  SPDLOG_INFO("succeeded to initialize the driver");
   return Status::OK();
 }
 
@@ -137,76 +161,46 @@ auto Dev::Detach() -> Status {
   return Status::OK();
 }
 
-// static auto AsyncSpdkCmd(IO *io) {
-//   class SpdkAwaitableCmd {
-//     static auto IoDone(void *ctx, const spdk_nvme_cpl *cpl) -> void {
-//       auto io = (IO *)ctx;
-//       if (spdk_nvme_cpl_is_error(cpl)) {
-//         SPDLOG_ERROR("nvme io error status: {}",
-//                      spdk_nvme_cpl_get_status_string(&cpl->status));
-//       }
-//       io->done.store(true);
-//     }
+auto Dev::IO::Issue(spdk_nvme_cmd_cb cb, void *cb_arg) -> void {
+  // submit
+  int rc = 0;
+  switch (type) {
+    case IO::Type::Read: {
+      rc = spdk_nvme_ns_cmd_read(dev->ns_, dev->qpair_, payload, lba, lba_count,
+                                 cb, cb_arg, io_flags);
+      break;
+    }
+    case IO::Type::Write: {
+      rc = spdk_nvme_ns_cmd_write(dev->ns_, dev->qpair_, payload, lba,
+                                  lba_count, cb, cb_arg, io_flags);
+      break;
+    }
+  }
 
-//    public:
-//     SpdkAwaitableCmd(IO *io) : io_(io) {}
+  // may be wrong
+  if (rc < 0) {
+    if (rc == -EINVAL) {
+      status = Status::InvalidArgs();
+    } else if (rc == -ENOMEM) {
+      status = Status::IoQueueFull();
+    } else if (rc == -ENXIO) {
+      status = Status::DeviceFailure();
+    }
+  }
+}
 
-//    public:
-//     auto await_ready() -> bool {
-//       // submit
-//       int rc = 0;
-//       switch (io_->type) {
-//         case IO::Type::Read: {
-//           rc =
-//               spdk_nvme_ns_cmd_read(io_->ns, io_->qpair, io_->payload,
-//               io_->lba,
-//                                     io_->lba_count, IoDone, io_,
-//                                     io_->io_flags);
-//           break;
-//         }
-//         case IO::Type::Write: {
-//           rc = spdk_nvme_ns_cmd_write(io_->ns, io_->qpair, io_->payload,
-//                                       io_->lba, io_->lba_count, IoDone, io_,
-//                                       io_->io_flags);
-//           break;
-//         }
-//       }
+auto Dev::Read(void *buf, uint64_t start_lba, uint32_t n_lba, uint32_t flags)
+    -> boost::asio::awaitable<Status> {
+  IO io(IO::Type::Read, this, start_lba, n_lba, buf, flags);
+  co_await AsyncSpdkNvmeCmd(&io, boost::asio::use_awaitable);
+  co_return io.GetStatus();
+}
 
-//       // may be wrong
-//       if (rc < 0) {
-//         // return error code
-//         if (rc == -EINVAL) {
-//           io_->status = Status::InvalidArgs();
-//         } else if (rc == -ENOMEM) {
-//           io_->status = Status::IoQueueFull();
-//         } else if (rc == -ENXIO) {
-//           io_->status = Status::DeviceFailure();
-//         }
-//         io_->done.store(true);
-//         return true;
-//       }
-
-//       // normal case
-//       return false;
-//     }
-
-//     auto await_suspend(std::coroutine_handle<> h) -> bool {
-//       return not io_->done.load(std::memory_order_relaxed);
-//     }
-
-//     auto await_resume() -> Status { return io_->status; }
-
-//    private:
-//     IO *io_;
-//   };
-
-//   return SpdkAwaitableCmd{io};
-// }
-
-auto Dev::Read(void *buffer, uint64_t start_lba, uint32_t n_lba)
-    -> asio::awaitable<Status> {
-  // using fn_t = Status (*)(void *, uint64_t, uint32_t);
-  asio::async_compose()
+auto Dev::Write(void *buf, uint64_t start_lba, uint32_t n_lba, uint32_t flags)
+    -> boost::asio::awaitable<Status> {
+  IO io(IO::Type::Write, this, start_lba, n_lba, buf, flags);
+  co_await AsyncSpdkNvmeCmd(&io, boost::asio::use_awaitable);
+  co_return io.GetStatus();
 }
 
 }  // namespace driver
